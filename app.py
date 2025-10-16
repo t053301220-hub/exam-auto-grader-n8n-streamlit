@@ -24,7 +24,7 @@ from reportlab.lib.enums import TA_CENTER
 
 # -------------------- CONFIGURACIÓN --------------------
 # Tu API key (la solicitaste incrustada)
-GEMINI_API_KEY = "AIzaSyBBxiisLsoPKLvKdWpjcE7cTtyXsRWQN7s"
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 # Modelo que usaremos vía REST
 GEMINI_REST_MODEL = "gemini-1.5-flash"
 # Cuántas páginas procesar por PDF (puedes aumentar si tu app permite más tokens)
@@ -360,4 +360,5 @@ if st.session_state.get("resultados"):
             now = datetime.now().strftime("%Y%m%d_%H%M%S")
             nombre = f"reporte_{st.session_state.curso_codigo or 'curso'}_{now}.pdf"
             st.download_button("⬇️ Descargar reporte", data=pdf_buf, file_name=nombre, mime="application/pdf")
+
 
