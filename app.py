@@ -370,25 +370,3 @@ if results:
 else:
     st.info('Aún no hay resultados. Ingresa la clave y sube PDFs, luego presiona "Analizar en n8n (simulado)"')
 
-# ----------------------------- Notas e instrucciones -----------------------------
-st.markdown('---')
-st.header('Notas técnicas y dependencias')
-st.markdown('''
-- Este script intenta múltiples estrategias para extraer respuestas: extracción de texto (pdfplumber), renderizado a imágenes (PyMuPDF) y OCR (pytesseract).
-- **Recomendado** instalar: `pdfplumber`, `PyMuPDF` (`fitz`), `pytesseract`, `Pillow`, `fpdf`.
-- Si no deseas o no puedes instalar `tesseract-ocr` en el servidor, la app intentará extraer texto directamente del PDF. Para PDFs escaneados, la precisión dependerá de tener OCR disponible.
-
-Instalación (ejemplo):
-```
-pip install streamlit pdfplumber pymupdf pytesseract pillow fpdf
-# y en el servidor (si quieres OCR): instalar tesseract (sistema operativo)
-```
-
-Despliegue en Streamlit Cloud / Streamlit Community:
-1. Crea un repo en GitHub con este archivo `streamlit_exam_grader_app.py`.
-2. En Streamlit Cloud (https://streamlit.io), conecta tu repo y selecciona el archivo como `app.py` (o renombral0 como `app.py`).
-3. Asegúrate de declarar las dependencias en `requirements.txt`.
-
-''')
-
-# Fin del archivo
