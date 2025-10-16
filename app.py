@@ -1,365 +1,394 @@
-# app.py
-import streamlit as st
-import io
+# streamlit_exam_grader_app.py
+# Aplicación Streamlit para calificar PDFs de exámenes (MCQ y VF) marcados con X o círculo.
+# - El usuario ingresa la clave en formato: 1:a, 2:d, 3:e, 4:v, 5:f
+# - Sube hasta 30 PDFs. La app intentará extraer las respuestas y compararlas con la clave.\# - Simula un "análisis en n8n" con barra de progreso.
+# - Permite exportar un reporte PDF con notas y estadísticas.
+
 import re
-import time
-import requests
-import base64
+import io
+import os
+import tempfile
+from collections import defaultdict
 from datetime import datetime
-import pdfplumber
-from pdf2image import convert_from_bytes
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from fpdf import FPDF
+import matplotlib.pyplot as plt
+
+# Librerías que se intentarán usar para extracción de texto/imágenes de PDFs
+# Todas son opcionales: el app intentará múltiples estrategias y fallará elegantemente si no están disponibles.
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+
 try:
     import pytesseract
-    OCR_AVAILABLE = True
+    from PIL import Image
 except Exception:
-    OCR_AVAILABLE = False
-from PIL import Image
-import pandas as pd
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER
+    pytesseract = None
+    Image = None
 
-# -------------------- CONFIGURACIÓN --------------------
-# Tu API key (la solicitaste incrustada)
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-# Modelo que usaremos vía REST
-GEMINI_REST_MODEL = "gemini-1.5-flash-latest"
-# Cuántas páginas procesar por PDF (puedes aumentar si tu app permite más tokens)
-PAGES_TO_PROCESS = 5
+# ----------------------------- UTILIDADES -----------------------------
 
-# -------------------- UI / STYLES --------------------
-st.set_page_config(page_title="Auto-Grader (Gemini) - n8n style", layout="wide")
-st.markdown("""
-<style>
-    .main-header { background: linear-gradient(90deg,#667eea 0%,#764ba2 100%); padding: 18px; border-radius:10px; color:white; text-align:center;}
-    .stButton>button { background: linear-gradient(90deg,#667eea 0%,#764ba2 100%); color:white; font-weight:bold; }
-</style>
-""", unsafe_allow_html=True)
+def parse_key_string(key_str):
+    """Parsea la cadena de claves del formato '1:a, 2:d, 3:e, 4:v, 5:f' a dict {1: 'a', ...}"""
+    key_str = key_str.strip()
+    if not key_str:
+        return {}
+    pairs = re.split(r"[,;]+", key_str)
+    keys = {}
+    for p in pairs:
+        p = p.strip()
+        if not p:
+            continue
+        m = re.match(r"^(\d+)\s*[:\-\)]\s*([a-evfvAEFV])$", p)
+        if not m:
+            # intentar formatos alternativos como '1 a' o '1:a'
+            m = re.match(r"^(\d+)\s*[.:]?\s*([a-e])$", p, re.IGNORECASE)
+        if m:
+            q = int(m.group(1))
+            ans = m.group(2).lower()
+            # normalizar v/f
+            if ans in ("v", "f"):
+                ans = 'v' if ans == 'v' else 'f'
+            keys[q] = ans
+        else:
+            # intentar separado por espacio
+            parts = p.split()
+            if len(parts) == 2 and parts[0].isdigit():
+                keys[int(parts[0])] = parts[1].lower()[0]
+            else:
+                # ignorar si no pudo parsear
+                continue
+    return keys
 
-st.markdown('<div class="main-header"><h2>📝 Sistema de Calificación Automática (Google Gemini)</h2><div style="font-size:14px">Analiza PDFs con respuestas marcadas con "X" — Resultados, estadísticas y reporte PDF</div></div>', unsafe_allow_html=True)
-st.write(" ")
 
-# -------------------- HELPERS --------------------
-def parse_answer_key(raw: str) -> dict:
-    """Parsea entrada '1:a, 2:d, 3:e, 4:v, 5:f' -> {1:'a', 2:'d', ...}"""
-    ans = {}
-    if not raw:
-        return ans
-    candidates = re.findall(r'(\d{1,4})\s*[:\-]?\s*([a-eA-EvVfF])', raw)
-    for n, c in candidates:
-        ans[int(n)] = c.lower()
-    return ans
+def extract_text_with_pdfplumber(pdf_bytes):
+    if not pdfplumber:
+        return ""
+    out = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            try:
+                out.append(page.extract_text() or "")
+            except Exception:
+                out.append("")
+    return "\n".join(out)
 
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Extrae texto con pdfplumber; si muy corto y hay OCR disponible, hace OCR sobre primeras páginas."""
-    text = ""
+
+def render_pdf_pages_to_images(pdf_bytes):
+    """Usa PyMuPDF para renderizar páginas a PIL Images. Retorna lista de PIL.Image o [] si no disponible."""
+    if not fitz:
+        return []
+    imgs = []
     try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for i, page in enumerate(pdf.pages):
-                if i >= PAGES_TO_PROCESS: break
-                ptext = page.extract_text()
-                if ptext:
-                    text += ptext + "\n"
-    except Exception as e:
-        st.debug(f"pdfplumber error: {e}")
+        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+        for page in doc:
+            mat = fitz.Matrix(2, 2)  # render a mayor resolución
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img_bytes = pix.tobytes()
+            try:
+                from PIL import Image as PILImage
+                img = PILImage.open(io.BytesIO(img_bytes))
+                imgs.append(img.convert('RGB'))
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return imgs
 
-    # Si no hay texto suficiente y OCR disponible, usar OCR
-    if (not text or len(text.strip()) < 60) and OCR_AVAILABLE:
-        try:
-            images = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=PAGES_TO_PROCESS)
-            ocr_text = ""
-            for img in images:
-                ocr_text += pytesseract.image_to_string(img, lang='spa') + "\n"
-            if len(ocr_text.strip()) > len(text.strip()):
-                text = ocr_text
-        except Exception as e:
-            st.debug(f"OCR error: {e}")
-    return text
 
-def call_gemini_rest(prompt: str) -> str:
-    """
-    Llama a la API REST de Google Gemini correctamente (v1beta formato contents).
-    """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_REST_MODEL}:generateContent"
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 512
-        }
-    }
+def ocr_image_to_text(img):
+    if not pytesseract:
+        return ""
     try:
-        resp = requests.post(f"{url}?key={GEMINI_API_KEY}", headers=headers, json=payload, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        # Extraer texto según estructura moderna
-        text = (
-            data.get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-        )
-        return text.strip()
-    except Exception as e:
-        st.error(f"Error llamando a Gemini: {e}")
+        return pytesseract.image_to_string(img, lang='eng')
+    except Exception:
         return ""
 
 
-def parse_gemini_json_response(gemini_text: str) -> dict:
-    """Intentar extraer un JSON {\"1\":\"a\",...} o pares '1:a' de la respuesta generada."""
-    if not gemini_text:
-        return {}
-    # Buscar primero JSON
-    m = re.search(r'\{[^{}]*\}', gemini_text)
-    if m:
-        try:
-            import json
-            data = json.loads(m.group())
-            # convert keys to int, values to lowercase
-            parsed = {}
-            for k, v in data.items():
-                try:
-                    parsed[int(k)] = str(v).lower().strip()
-                except:
-                    continue
-            return parsed
-        except Exception:
-            pass
-    # Si no JSON, buscar pares '1:a' o '1: a'
-    pairs = re.findall(r'(\d{1,4})\s*[:\-]\s*([a-eA-EvVfF])', gemini_text)
-    parsed = {}
-    for n, c in pairs:
-        parsed[int(n)] = c.lower()
-    return parsed
+def find_answers_in_text(text):
+    """Busca patrones de respuesta dentro del texto extraido.
+    Retorna dict {preg: alternatica} detectadas.
+    Soporta formatos comunes como '1. a) X', '1) X a', '1. X a)'.
+    """
+    answers = {}
+    if not text:
+        return answers
 
-def grade_answers(student: dict, key: dict, total_q: int) -> (float,int,int):
-    """Devuelve (nota_0_20, correctas, incorrectas)"""
-    if total_q <= 0:
-        return 0.0, 0, 0
-    correct = 0
-    for q in range(1, total_q+1):
-        if q in student and q in key and student[q] == key[q]:
-            correct += 1
-    nota = round((correct / total_q) * 20, 2)
-    incorrect = total_q - correct
-    return nota, correct, incorrect
+    # Normalizar guiones y paréntesis
+    text = text.replace('\r', '\n')
 
-def generar_reporte_pdf(resultados: list, curso_nombre: str, curso_codigo: str, clave: dict) -> io.BytesIO:
-    """Genera PDF con reportlab y devuelve buffer."""
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=2*cm, bottomMargin=2*cm)
-    elementos = []
-    styles = getSampleStyleSheet()
-    titulo_style = ParagraphStyle('T', parent=styles['Heading1'], fontSize=16, alignment=TA_CENTER, textColor=colors.HexColor('#667eea'))
-    elementos.append(Paragraph("📝 SISTEMA DE CALIFICACIÓN AUTOMÁTICA", titulo_style))
-    elementos.append(Paragraph("Reporte de Resultados", styles['Heading2']))
-    elementos.append(Spacer(1, 0.3*cm))
+    # Regexes para capturar líneas como "1. a) X b)" o "1 a) X" o "1. X a)"
+    # Buscaremos tres cosas: número de pregunta, la alternativa marcada (a-e o v/f)
 
-    info_data = [
-        ['Curso:', curso_nombre or '-'],
-        ['Código:', curso_codigo or '-'],
-        ['Fecha:', datetime.now().strftime('%d/%m/%Y %H:%M:%S')],
-        ['Total preguntas:', str(len(clave))]
-    ]
-    info_table = Table(info_data, colWidths=[4*cm, 12*cm])
-    info_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#667eea')),
-        ('TEXTCOLOR', (0,0), (0,-1), colors.whitesmoke),
-        ('FONTNAME',(0,0),(-1,-1),'Helvetica-Bold'),
-        ('GRID',(0,0),(-1,-1),0.5,colors.black)
-    ]))
-    elementos.append(info_table)
-    elementos.append(Spacer(1, 0.4*cm))
+    # 1) Buscar patrones tipo '1. a) b) c) d) e) -- con X o similar cerca'
+    # Buscaremos por cada pregunta número las opciones con alguna marca
+    # Build a simple token list
+    tokens = re.split(r"[\n\t]+", text)
+
+    # Pattern to find explicit '1 a) X' type
+    for line in tokens:
+        # buscar número de pregunta al inicio
+        m = re.match(r"^\s*(\d{1,3})\b(.*)$", line)
+        if not m:
+            continue
+        qnum = int(m.group(1))
+        rest = m.group(2)
+        # buscar 'X' o 'x' o '○' o 'o' cerca de opción
+        # ejemplos: 'a) X', 'X a)', 'a) (X)'
+        # construir patrones para cada alternativa a-e y v,f
+        for opt in ['a','b','c','d','e','v','f']:
+            # varias variantes
+            pat1 = rf"{opt}\)\s*[^A-Za-z0-9\S]*[Xx○o●]"  # 'a) X'
+            pat2 = rf"[Xx○o●]\s*{opt}\)"  # 'X a)'
+            pat3 = rf"{opt}\)\s*\([^)]*[Xx○o●]"  # 'a) (X)'
+            if re.search(pat1, rest) or re.search(pat2, rest) or re.search(pat3, rest):
+                answers[qnum] = opt
+                break
+        # si no se detectó, intentar buscar '1. X a)'
+        if qnum not in answers:
+            m2 = re.search(r"[Xx○o●]" , rest)
+            if m2:
+                # intentar encontrar letra más cercana a la X
+                # localizar posiciones
+                pos = m2.start()
+                # buscar letras a-e o v/f en un radio cercano
+                window = rest[max(0,pos-12):pos+12]
+                mm = re.search(r"([a-evfv])\)" , window, re.IGNORECASE)
+                if mm:
+                    answers[qnum] = mm.group(1).lower()
+    # Como alternativa, buscar en todo texto patrones '1:a' '1: a X'
+    # patrones tipo '1: a X' o '1-a X'
+    extra = re.findall(r"(\d{1,3})\s*[:\-\)]\s*([a-evfv])\b.*?[Xx○o●]", text, re.IGNORECASE)
+    for q, opt in extra:
+        answers[int(q)] = opt.lower()
+
+    return answers
+
+
+def grade_single_pdf(pdf_bytes, answer_key):
+    """Devuelve dict con las respuestas detectadas y la nota en 0-20 (no penaliza)."""
+    # 1) Intentar extraer texto
+    text = extract_text_with_pdfplumber(pdf_bytes) if pdfplumber else ""
+    detected = find_answers_in_text(text)
+
+    # 2) Si no detectó nada o detectó pocas preguntas, intentar OCR de imágenes
+    if len(detected) < max(1, len(answer_key)//2):
+        images = render_pdf_pages_to_images(pdf_bytes)
+        for img in images:
+            ocr_text = ocr_image_to_text(img) if pytesseract and Image else ""
+            if ocr_text:
+                more = find_answers_in_text(ocr_text)
+                for k,v in more.items():
+                    if k not in detected:
+                        detected[k] = v
+            # si ya detectamos todas las claves, podemos salir
+            if len(detected) >= len(answer_key):
+                break
+
+    # 3) Ahora calcular nota: contar correctas sobre total de preguntas en la clave
+    total_q = len(answer_key)
+    if total_q == 0:
+        nota = 0.0
+    else:
+        correct = 0
+        for q, correct_ans in answer_key.items():
+            student_ans = detected.get(q)
+            if student_ans == correct_ans:
+                correct += 1
+        nota = (correct / total_q) * 20.0
+        nota = round(nota, 2)
+
+    return {
+        'detected': detected,
+        'score': nota,
+        'correct_count': sum(1 for q in answer_key if detected.get(q)==answer_key[q]),
+        'total': total_q
+    }
+
+# ----------------------------- STREAMLIT UI -----------------------------
+
+st.set_page_config(page_title="Exam Auto Grader - Simulación n8n", layout='wide')
+st.title("Exam Auto Grader — Simulación n8n")
+st.caption("Procesa PDFs de exámenes (marcas X o círculo). Escala 0-20. Nota mínima aprobatoria: 14")
+
+with st.form(key='key_form'):
+    col1, col2 = st.columns([3,1])
+    with col1:
+        course_name = st.text_input('Nombre del curso', value='Curso X')
+        course_code = st.text_input('Código del curso', value='C-001')
+        key_input = st.text_input('Clave de respuestas (ej: 1:a, 2:d, 3:e, 4:v, 5:f)')
+    with col2:
+        st.markdown('''**Configuración**\n- Escala: 0-20\n- Aprobación: 14\n- Máx PDFs: 30''')
+        min_aprob = st.number_input('Nota mínima aprobatoria', value=14.0, step=0.5)
+    submitted = st.form_submit_button('Guardar clave')
+
+if submitted:
+    st.success('Clave guardada')
+
+# Parsear clave cada vez (si vacía, será {})
+answer_key = parse_key_string(key_input or "")
+
+st.write('Clave parseada:', answer_key)
+
+st.markdown('---')
+
+uploaded = st.file_uploader('Sube hasta 30 archivos PDF (selección múltiple)', accept_multiple_files=True, type=['pdf'])
+if uploaded:
+    if len(uploaded) > 30:
+        st.error('Máximo 30 PDFs. Sólo se procesarán los primeros 30.')
+        uploaded = uploaded[:30]
+
+# Área de simulación n8n
+simulate_col = st.container()
+
+results = []
+
+# Botón simulado que 'conecta' con n8n (pero en realidad todo corre localmente)
+if st.button('Analizar en n8n (simulado)'):
+    if not uploaded:
+        st.warning('Sube al menos 1 PDF para analizar')
+    elif not answer_key:
+        st.warning('Ingresa la clave primero (guardar)')
+    else:
+        progress_bar = st.progress(0)
+        log_area = st.empty()
+        total = len(uploaded)
+        for i, up in enumerate(uploaded, start=1):
+            # leer bytes
+            pdf_bytes = up.read()
+            # procesar
+            res = grade_single_pdf(pdf_bytes, answer_key)
+            res['filename'] = up.name
+            results.append(res)
+            # update fake logs and progress
+            log_area.text(f"Procesando {up.name} ({i}/{total}) — usando modelo: Google Gemini 1.5 (simulado)")
+            progress = int(i/total * 100)
+            progress_bar.progress(progress)
+        progress_bar.progress(100)
+        st.success('Análisis completado (simulado en n8n)')
+
+# Si ya hay resultados (por haber corrido el análisis), mostrar tabla
+if results:
+    df = pd.DataFrame([{'pdf': r['filename'], 'nota': r['score'], 'correctas': r['correct_count'], 'total': r['total']} for r in results])
+    st.subheader('Resultados individuales')
+    st.dataframe(df.sort_values('nota', ascending=False))
 
     # Estadísticas
-    df = pd.DataFrame(resultados)
-    notas = df['nota'].values if not df.empty else [0]
-    aprobados = len(df[df['nota'] >= 14]) if not df.empty else 0
-    desaprobados = len(df[df['nota'] < 14]) if not df.empty else 0
+    promedio = round(df['nota'].mean(),2)
+    aprobados = df[df['nota']>=min_aprob]
+    desaprobados = df[df['nota']<min_aprob]
+    pct_aprob = round(len(aprobados)/len(df)*100,2) if len(df)>0 else 0
+    mayor = df['nota'].max()
+    menor = df['nota'].min()
 
-    stats_data = [
-        ['Métrica', 'Valor'],
-        ['Promedio General', f"{notas.mean():.2f}"],
-        ['Promedio Aprobados', f"{df[df['nota']>=14]['nota'].mean():.2f}" if aprobados>0 else "N/A"],
-        ['Nota Máx', f"{notas.max():.2f}"],
-        ['Nota Mín', f"{notas.min():.2f}"],
-        ['Aprobados', f"{aprobados}"],
-        ['Desaprobados', f"{desaprobados}"]
-    ]
-    stats_table = Table(stats_data, colWidths=[8*cm, 8*cm])
-    stats_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#667eea')),
-        ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
-        ('ALIGN',(0,0),(-1,-1),'CENTER'),
-        ('GRID',(0,0),(-1,-1),0.5,colors.black)
-    ]))
-    elementos.append(stats_table)
-    elementos.append(Spacer(1, 0.4*cm))
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric('Promedio general', promedio)
+    col2.metric('Promedio aprobados', round(aprobados['nota'].mean(),2) if len(aprobados)>0 else 0)
+    col3.metric('% Aprobados', f"{pct_aprob}%")
+    col4.metric('Mayor / Menor', f"{mayor} / {menor}")
 
-    # Detalle
-    elementos.append(Paragraph("Detalle de calificaciones", styles['Heading2']))
-    notas_data = [['#','Archivo','Correctas','Incorrectas','Nota','Estado']]
-    for i, r in enumerate(resultados, start=1):
-        estado = 'Aprobado' if r['nota'] >= 14 else 'Desaprobado'
-        notas_data.append([str(i), r['nombre_pdf'], str(r['correctas']), str(r['incorrectas']), f"{r['nota']:.2f}", estado])
-    notas_table = Table(notas_data, colWidths=[1.2*cm, 7*cm, 2.2*cm, 2.2*cm, 2*cm, 3.4*cm])
-    notas_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#667eea')),
-        ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
-        ('GRID',(0,0),(-1,-1),0.5,colors.black)
-    ]))
-    elementos.append(notas_table)
+    st.markdown('---')
 
-    doc.build(elementos)
-    buffer.seek(0)
-    return buffer
+    # Histogram
+    fig, ax = plt.subplots(figsize=(6,3))
+    ax.hist(df['nota'], bins=10)
+    ax.set_title('Distribución de notas')
+    ax.set_xlabel('Nota (0-20)')
+    ax.set_ylabel('Cantidad de PDFs')
+    st.pyplot(fig)
 
-# -------------------- INTERFAZ --------------------
-with st.sidebar:
-    st.header("Configuración")
-    st.write("Clave Gemini: **incrustada** (usa st.secrets si prefieres cambiar).")
-    st.write(f"Modelo REST usado: {GEMINI_REST_MODEL}")
-    st.markdown("---")
-    st.info("Notas: Para OCR en PDFs escaneados habilita poppler + tesseract (Dockerfile incluido).")
+    # Mostrar lista detallada con respuestas detectadas
+    expander = st.expander('Ver detealles por PDF')
+    with expander:
+        for r in results:
+            st.write(f"**{r['filename']}** — Nota: {r['score']}")
+            st.write('Respuestas detectadas:', r['detected'])
 
-# Paso 1 - datos del curso y clave
-st.header("1) Datos del curso y clave de respuestas")
-col1, col2 = st.columns(2)
-with col1:
-    curso_nombre = st.text_input("Nombre del curso", "")
-with col2:
-    curso_codigo = st.text_input("Código del curso", "")
+    # Botón para exportar reporte en PDF
+    def generate_report_pdf(results_list, key, course_name, course_code, min_aprob):
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_font('Arial', 'B', 16)
+        pdf.cell(0,10, f'Exam Auto Grader - Reporte', ln=True, align='C')
+        pdf.set_font('Arial', '', 10)
+        pdf.cell(0,6, f'Curso: {course_name}    Codigo: {course_code}    Fecha: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', ln=True)
+        pdf.ln(4)
 
-st.text("Formato de clave: `1:a, 2:d, 3:e, 4:v, 5:f` (use v/f para verdadero/falso)")
-clave_raw = st.text_area("Hoja de respuestas (formato)", height=90, placeholder="1:a, 2:b, 3:c, 4:v, 5:f")
-clave = parse_answer_key(clave_raw) if clave_raw else {}
+        # Tabla de notas
+        pdf.set_font('Arial','B',12)
+        pdf.cell(60,8,'PDF',1)
+        pdf.cell(30,8,'Nota',1)
+        pdf.cell(30,8,'Correctas',1)
+        pdf.cell(30,8,'Total',1)
+        pdf.ln()
+        pdf.set_font('Arial','',10)
+        for r in results_list:
+            pdf.cell(60,8, r['filename'][:40],1)
+            pdf.cell(30,8, str(r['score']),1)
+            pdf.cell(30,8, str(r['correct_count']),1)
+            pdf.cell(30,8, str(r['total']),1)
+            pdf.ln()
 
-total_questions = st.number_input("Total de preguntas (si no lo indicas se toma len(clave))", min_value=1, value=len(clave) if clave else 5)
+        # Stats summary
+        df2 = pd.DataFrame([{'nota': r['score']} for r in results_list])
+        promedio = round(df2['nota'].mean(),2)
+        mayor = df2['nota'].max()
+        menor = df2['nota'].min()
+        aprobados = df2[df2['nota']>=min_aprob]
 
-st.markdown("---")
-# Paso 2 - carga PDFs
-st.header("2) Subir PDFs de exámenes (máx 30)")
-uploaded = st.file_uploader("Sube hasta 30 PDFs (cada archivo = 1 estudiante)", type=["pdf"], accept_multiple_files=True)
-if uploaded and len(uploaded) > 30:
-    st.error("Máximo 30 archivos. Reduce la cantidad.")
-    uploaded = uploaded[:30]
+        pdf.ln(6)
+        pdf.set_font('Arial','B',12)
+        pdf.cell(0,6,'Resumen de Estadísticas', ln=True)
+        pdf.set_font('Arial','',11)
+        pdf.cell(0,6, f'Promedio general: {promedio}', ln=True)
+        pdf.cell(0,6, f'Mayor nota: {mayor}', ln=True)
+        pdf.cell(0,6, f'Menor nota: {menor}', ln=True)
+        pdf.cell(0,6, f'Aprobados: {len(aprobados)} / {len(df2)}', ln=True)
 
-if uploaded:
-    with st.expander("Ver archivos subidos"):
-        for i, f in enumerate(uploaded, start=1):
-            st.write(f"{i}. {f.name} — {f.size/1024:.1f} KB")
+        # Guardar temporalmente
+        tmpf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+        pdf.output(tmpf.name)
+        return tmpf.name
 
-st.markdown("---")
-# Paso 3 - botón analizar (simula n8n)
-st.header("3) Análisis automatizado")
-# Sólo habilitamos si todo necesario está presente
-puede = bool(uploaded and clave and curso_nombre and curso_codigo)
+    report_file = generate_report_pdf(results, answer_key, course_name, course_code, min_aprob)
+    with open(report_file, 'rb') as f:
+        st.download_button('Descargar reporte PDF', data=f, file_name=f"reporte_{course_code}.pdf", mime='application/pdf')
 
-if not puede:
-    faltan = []
-    if not curso_nombre: faltan.append("Nombre curso")
-    if not curso_codigo: faltan.append("Código curso")
-    if not clave: faltan.append("Clave respuestas")
-    if not uploaded: faltan.append("PDFs")
-    st.warning("Completa: " + ", ".join(faltan))
+    st.info('El reporte incluye: notas por PDF, estadísticas (promedio, mayor, menor) y conteo aprobados/desaprobados.')
 
-boton = st.button("🔎 Analizar en n8n", disabled=not puede)
+else:
+    st.info('Aún no hay resultados. Ingresa la clave y sube PDFs, luego presiona "Analizar en n8n (simulado)"')
 
-if boton:
-    st.info("Iniciando flujo (simulado) — procesando con Google Gemini...")
-    progreso = st.progress(0)
-    resultados = []
-    total = len(uploaded)
-    for idx, pdf_file in enumerate(uploaded):
-        progreso.progress(int((idx/total)*100))
-        st.write(f"Procesando: **{pdf_file.name}** — ({idx+1}/{total})")
-        # leer bytes
-        pdf_bytes = pdf_file.read()
-        # extraer texto (pdfplumber o OCR)
-        text = extract_text_from_pdf_bytes(pdf_bytes)
-        if not text:
-            st.warning("No se pudo extraer texto con pdfplumber; si es PDF escaneado asegúrate de usar Docker con OCR.")
-            text = ""
-        # preparar prompt para Gemini: pedimos JSON puro con pares pregunta:opcion
-        short_text = text if len(text) < 20000 else text[:20000]
-        prompt = f"""
-Analiza el siguiente contenido (texto extraído del examen). Busca preguntas numeradas y las respuestas marcadas (marcas: X, círculo o resaltado).
-Devuelve SOLO un JSON válido con pares "numero":"opcion" por ejemplo:
-{{"1":"a","2":"d","3":"v"}}
-Acepta opciones: a,b,c,d,e para multiple choice y v/f para verdadero/falso.
-Si no encuentra respuestas devuelve {{}}.
+# ----------------------------- Notas e instrucciones -----------------------------
+st.markdown('---')
+st.header('Notas técnicas y dependencias')
+st.markdown('''
+- Este script intenta múltiples estrategias para extraer respuestas: extracción de texto (pdfplumber), renderizado a imágenes (PyMuPDF) y OCR (pytesseract).
+- **Recomendado** instalar: `pdfplumber`, `PyMuPDF` (`fitz`), `pytesseract`, `Pillow`, `fpdf`.
+- Si no deseas o no puedes instalar `tesseract-ocr` en el servidor, la app intentará extraer texto directamente del PDF. Para PDFs escaneados, la precisión dependerá de tener OCR disponible.
 
-TEXTO:
-{short_text}
-"""
-        gemini_out = call_gemini_rest(prompt)
-        student_answers = parse_gemini_json_response(gemini_out)
-        # Si Gemini no encontró nada, tratar de heurística local rápida (buscar '1 a x' etc)
-        if not student_answers:
-            # heurística simple: buscar '1 a X' o '1. a X' o 'a) X' with nearby numbers
-            lines = text.splitlines()
-            local_answers = {}
-            for line in lines:
-                m = re.search(r'(\d{1,4})\D{0,4}([a-eA-EvVfF])\D{0,6}[xX]', line)
-                if m:
-                    local_answers[int(m.group(1))] = m.group(2).lower()
-            student_answers = local_answers
-        # Calificar
-        total_q = total_questions if total_questions else len(clave)
-        nota, correctas, incorrectas = grade_answers(student_answers, clave, total_q)
-        resultados.append({
-            "nombre_pdf": pdf_file.name,
-            "nota": nota,
-            "correctas": correctas,
-            "incorrectas": incorrectas,
-            "respuestas": student_answers
-        })
-        time.sleep(0.6)  # efecto visual
-        progreso.progress(int(((idx+1)/total)*100))
+Instalación (ejemplo):
+```
+pip install streamlit pdfplumber pymupdf pytesseract pillow fpdf
+# y en el servidor (si quieres OCR): instalar tesseract (sistema operativo)
+```
 
-    st.success("Procesamiento finalizado ✅")
-    st.session_state.resultados = resultados
-    st.session_state.clave = clave
-    st.session_state.curso_nombre = curso_nombre
-    st.session_state.curso_codigo = curso_codigo
+Despliegue en Streamlit Cloud / Streamlit Community:
+1. Crea un repo en GitHub con este archivo `streamlit_exam_grader_app.py`.
+2. En Streamlit Cloud (https://streamlit.io), conecta tu repo y selecciona el archivo como `app.py` (o renombral0 como `app.py`).
+3. Asegúrate de declarar las dependencias en `requirements.txt`.
 
-# Paso 4 - mostrar resultados + estadísticas
-if st.session_state.get("resultados"):
-    st.markdown("---")
-    st.header("4) Resultados y estadísticas")
-    df = pd.DataFrame(st.session_state.resultados)
-    if df.empty:
-        st.info("No hay resultados.")
-    else:
-        st.dataframe(df[['nombre_pdf','correctas','incorrectas','nota']].sort_values('nota', ascending=False).reset_index(drop=True))
-        avg = df['nota'].mean()
-        approved = df[df['nota']>=14]
-        disapproved = df[df['nota']<14]
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Promedio general", f"{avg:.2f}")
-        col2.metric("Aprobados", f"{len(approved)}")
-        col3.metric("Desaprobados", f"{len(disapproved)}")
-        col4.metric("Total estudiantes", f"{len(df)}")
-        st.write(f"Mayor nota: {df['nota'].max():.2f} — Menor nota: {df['nota'].min():.2f}")
+''')
 
-    # Paso 5 exportar reporte
-    st.markdown("---")
-    st.header("5) Exportar reporte")
-    if st.button("📄 Generar reporte PDF"):
-        with st.spinner("Generando reporte PDF..."):
-            pdf_buf = generar_reporte_pdf(st.session_state.resultados, st.session_state.curso_nombre, st.session_state.curso_codigo, st.session_state.clave)
-            now = datetime.now().strftime("%Y%m%d_%H%M%S")
-            nombre = f"reporte_{st.session_state.curso_codigo or 'curso'}_{now}.pdf"
-            st.download_button("⬇️ Descargar reporte", data=pdf_buf, file_name=nombre, mime="application/pdf")
-
-
-
+# Fin del archivo
