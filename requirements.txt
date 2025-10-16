@@ -1,8 +1,8 @@
-streamlit>=1.18
+streamlit
 pdfplumber
-pdf2image
-pillow
+pymupdf
 pytesseract
-requests
-reportlab
+pillow
+fpdf
 pandas
+matplotlib
