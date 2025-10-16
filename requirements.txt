@@ -1,5 +1,8 @@
-streamlit
+streamlit>=1.18
 pdfplumber
-fpdf
-google-generativeai
-statistics
+pdf2image
+pillow
+pytesseract
+requests
+reportlab
+pandas
