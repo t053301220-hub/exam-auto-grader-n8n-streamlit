@@ -80,43 +80,39 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     return text
 
 def call_gemini_rest(prompt: str) -> str:
-    """Llama a la REST API de Generative Language (Gemini) con la API key (GET param key)."""
+    """
+    Llama a la API REST de Google Gemini correctamente (v1beta formato contents).
+    """
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_REST_MODEL}:generateContent"
     headers = {"Content-Type": "application/json"}
     payload = {
-        "prompt": {
-            "messages": [
-                {"content": {"text": prompt}}
-            ]
-        },
-        # Limites modestos para evitar payload excesivo; ajustar si es necesario
-        "temperature": 0.0,
-        "candidate_count": 1,
-        "max_output_tokens": 1024
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 512
+        }
     }
     try:
-        resp = requests.post(f"{url}?key={GEMINI_API_KEY}", headers=headers, json=payload, timeout=40)
+        resp = requests.post(f"{url}?key={GEMINI_API_KEY}", headers=headers, json=payload, timeout=60)
         resp.raise_for_status()
-        j = resp.json()
-        # Intentos para obtener texto resultante en posibles campos
-        if "candidates" in j and isinstance(j["candidates"], list) and len(j["candidates"])>0:
-            c = j["candidates"][0]
-            # Formato: c["content"]["parts"][0]["text"] en algunas respuestas
-            if isinstance(c.get("content"), dict):
-                parts = c["content"].get("parts", [])
-                if parts:
-                    return parts[0].get("text","").strip()
-            # otras veces candidato puede ser texto directo
-            if isinstance(c.get("output"), str):
-                return c.get("output","").strip()
-        # fallback: buscar texto en 'output' o en 'text'
-        if "output" in j:
-            if isinstance(j["output"], list) and len(j["output"])>0 and isinstance(j["output"][0], dict):
-                return j["output"][0].get("content", {}).get("text", "").strip()
-        return str(j)
+        data = resp.json()
+        # Extraer texto según estructura moderna
+        text = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+        return text.strip()
     except Exception as e:
-        st.warning(f"Error llamando Gemini: {str(e)[:200]}")
+        st.error(f"Error llamando a Gemini: {e}")
         return ""
+
 
 def parse_gemini_json_response(gemini_text: str) -> dict:
     """Intentar extraer un JSON {\"1\":\"a\",...} o pares '1:a' de la respuesta generada."""
@@ -364,3 +360,4 @@ if st.session_state.get("resultados"):
             now = datetime.now().strftime("%Y%m%d_%H%M%S")
             nombre = f"reporte_{st.session_state.curso_codigo or 'curso'}_{now}.pdf"
             st.download_button("⬇️ Descargar reporte", data=pdf_buf, file_name=nombre, mime="application/pdf")
+
